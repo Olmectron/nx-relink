@@ -1,0 +1,5 @@
+build/
+out/
+games/
+*.keys
+__pycache__/

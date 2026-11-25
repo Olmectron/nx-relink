@@ -1,0 +1,333 @@
+// nx2-recomp: the port's own start. The game's modules are in this program already (tools/relink.py); this sets the log up, gives the
+// game a heap, does the loader's work and hands over to the game, for good: the main thread is the game's from then on.
+#include <switch.h>
+
+#include <malloc.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "nx2.h"
+
+// The host library's heap is the memory the homebrew loader hands over, nearly all a game may have. The game's own heap is taken off
+// its top before the C library has any of it: asked of malloc afterwards, a block of 2 GB or more was refused on a Switch with
+// 2.9 GB free (1792 MB was the most given; log, 2026-11-22), and a game needs 1.92 GB in one piece.
+static u8 *early_block;
+static u64 early_size, early_all;
+// (a Switch 2 game's: the part of the heap given back to the kernel, below)
+static u64 heap_was, heap_given, heap_at, heap_host;
+static u32 heap_given_rc;
+void __libnx_initheap(void) {
+    extern char *fake_heap_start, *fake_heap_end;
+    u8 *addr = NULL;
+    u64 size = 0;
+    if (envHasHeapOverride()) {
+        addr = envGetHeapOverrideAddr(), size = envGetHeapOverrideSize();
+    } else {
+        u64 total = 0, used = 0;
+        svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        if (total > used + 0x200000) size = (total - used - 0x200000) & ~0x1FFFFFull;
+        if (!size) size = 0x2000000 * 16;
+        if (R_FAILED(svcSetHeapSize((void **)&addr, size))) addr = NULL, size = 0;
+    }
+    early_all = size;
+#ifdef NX2_GAME_MB
+    // A Switch 2 game's SDK takes memory of its own from the kernel as it runs (MapPhysicalMemory, which gives what the process
+    // has not yet taken), and the loader this is started by has taken all there is for the heap it hands over: 4 MB were left,
+    // A game asked for 5 at its start, was refused (10801) and ended itself; with 256 MB given back to the
+    // kernel it went on to ask for all the memory it had been told of that same way, 7748 MB in one piece, where a game asks for its own as a heap (SetHeapSize) and for 4 KB that way (logs, 2026-11-25). A game's memory is its SDK's to
+    // take either way, so none is set aside here: the heap is made as small as the host's own part, 256 MB, before anything is
+    // put in it, and the rest is the kernel's again, to give the game as it asks (svc.c: its SetHeapSize makes the kernel's heap
+    // larger, after the host's part; its MapPhysicalMemory is the kernel's own).
+    {
+        u64 host = 256ull << 20;
+        // (with the modules kept whole, whole.c, each one's image and bss are put together in the host's heap before the loader
+        // service maps them: that much more is the host's. A game's seven are 190 MB, and with 256 MB in all the sixth had
+        // none; log, 2026-11-25.)
+        for (unsigned k = 0; nx2_whole && k < nx2_module_count; k++)
+            if (nx2_images[k].image) host += (nx2_modules[k].end + 0x2FFFFF) & ~0x1FFFFFull;
+        u64 base = 0, end = 0;
+        if (addr && size > 4 * host && R_SUCCEEDED(svcGetInfo(&base, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0))) {
+            for (end = base;;) {  // where the heap ends now
+                MemoryInfo mi;
+                u32 pi;
+                if (R_FAILED(svcQueryMemory(&mi, &pi, end)) || (mi.type & 0xFF) != MemType_Heap) break;
+                end = mi.addr + mi.size;
+            }
+            const u64 new_size = ((u64)addr + host - base + 0x1FFFFF) & ~0x1FFFFFull, new_end = base + new_size;
+            if ((u64)addr >= base && end > new_end + host && (u64)addr + size <= end) {
+                void *at = NULL;
+                heap_was = end - base;
+                heap_given_rc = svcSetHeapSize(&at, new_size);
+                if (R_SUCCEEDED(heap_given_rc)) {
+                    heap_given = end - new_end, heap_at = base, heap_host = new_size;
+                    size = new_end - (u64)addr;
+                }
+            }
+        }
+    }
+#endif
+    // The host's own (the log, the table of symbols, two threads' stacks) is a few MB, and it keeps 12: a game
+    // stops at its start, in a loop of one instruction, unless its heap is over 3136 MB (main+5499f4; log, 2026-11-22), and the
+    // loader hands over 3153.
+    // (12 was still too much: with 3140 MB the last of the game's four heaps, which are 3136 MB together, had a null; crash report,
+    // 2026-11-22. The table of symbols is 1 MB of the 4.)
+#ifdef __SWITCH2__
+    // A Switch 2 hands over some 9 GB. The game has what a Switch would give it, 3200 MB, and no more (its sums were made for that
+    // much); the rest is the host's, whose OpenGL the game draws with.
+    // (A Switch 2 game's own asks for far more: a game's heaps are some 7.5 GB together, its HeapDef file says, and it
+    // ended itself at its start with 3200 MB; log, 2026-11-24. Such a port is built with the size, tools/build.py --heap, and the
+    // host keeps less: the game's graphics are its own SDK's.)
+#ifdef NX2_GAME_MB
+    // (with the heap made the host's part alone, above, all that is left here is the host's: no block for the game)
+    const u64 keep = heap_given ? size : 512ull << 20, most = (u64)NX2_GAME_MB << 20;
+#else
+    const u64 keep = 1024ull << 20, most = 3200ull << 20;
+#endif
+    u64 game = size > keep ? (size - keep) & ~0x1FFFFFull : 0;
+    if (game > most) game = most;
+#else
+    const u64 keep = 4ull << 20;
+    u64 game = size > keep ? (size - keep) & ~0x1FFFFFull : 0;
+#endif
+    u8 *top = (u8 *)(((u64)addr + size) & ~0x1FFFFFull);
+    if (game >= (256ull << 20) && top - game >= addr + keep / 2) {
+        early_block = top - game, early_size = game;
+        size = (u64)(early_block - addr);
+    }
+    fake_heap_start = (char *)addr, fake_heap_end = (char *)addr + size;
+}
+
+// Before this program goes back to the loader that started it (not when the system closes it): the loader hands the next program
+// the heap as it was, so the part given back to the kernel is asked for again. If it can't be had, the process is ended here: a
+// program started on a heap with its top missing would end worse.
+static void heap_back(void) {
+    if (!heap_given) return;
+    void *at = NULL;
+    const Result rc = svcSetHeapSize(&at, heap_was);
+    nx2_log("[nx2] the %u MB of the heap given back to the kernel are taken again: %x\n", heap_given >> 20, (u64)rc);
+    nx2_log_flush();
+    if (R_FAILED(rc)) nx2_exit();
+    heap_given = 0;
+}
+
+int main(int argc, char **argv) {
+    (void)argc, (void)argv;
+    nx2_log_start();
+    u64 total = 0, used = 0;
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    const u32 hos = hosversionGet();
+    nx2_log("[nx2] nx2-recomp, built for %s; Horizon %u.%u.%u; applet type %u; memory %u MB, %u MB used\n",
+#ifdef __SWITCH2__
+            "Switch 2",
+#else
+            "Switch",
+#endif
+            (u64)HOSVER_MAJOR(hos), (u64)HOSVER_MINOR(hos), (u64)HOSVER_MICRO(hos), (u64)appletGetAppletType(), total >> 20, used >> 20);
+
+    // the game's heap: half of what's free, 1 GB at most, in 2 MB steps as the kernel gives it
+    // (asked of malloc, not worked out from the kernel's count of free memory: the host library has taken all of it for its own heap
+    // by now, and on a Switch 2 that count said 4 MB free of 9120, which left the game none; log, 2026-11-22)
+    // Each step said and written to the card before the next: with 1 GB asked of memalign in one go, a Switch 2 closed the program
+    // before the log's first write.
+    nx2_log_flush();
+    // 2.5 GB first, then less by 256 MB at a time: a game asks its allocator for 1.92 GB in one piece at its start, and with
+    // 1 GB had a null for it, which it used (crash report, 2026-11-22). A Switch has 3.2 GB for a game in all.
+    u64 heap = 2560ull << 20;
+    u8 *block = NULL;
+    nx2_log("[nx2] the memory handed to this program: %u MB; %u MB of it set aside for the game's heap\n", early_all >> 20, early_size >> 20);
+    int live = 0;  // (a Switch 2 game's: its memory is the kernel's to give as the game asks, none set aside)
+    if (heap_was) {
+        nx2_log("[nx2] of the loader's heap of %u MB, %u MB given back to the kernel for the game's SDK to take as it asks (%x); the host keeps %u MB\n",
+                heap_was >> 20, heap_given >> 20, (u64)heap_given_rc, heap_host >> 20);
+#ifdef NX2_GAME_MB
+        if (heap_given) {
+            // What the game is told it has: what it was built to be given, and not quite all that the kernel has (64 MB are left
+            // for what its SDK takes besides: its threads' stacks). Not more than that: with 512 MB left, a game was
+            // told of 7554 MB where it had had 7748, and ended as it loaded its world (its heaps are some 7.5 GB together; log,
+            // 2026-11-25). A game, which asks the kernel for everything it is told of in one piece, only tries that: it gives
+            // it back at once and takes what it needs as it goes.
+            const u64 slack = 64ull << 20;
+            u64 most = (u64)NX2_GAME_MB << 20;
+            if (heap_given < most + slack) most = heap_given > slack ? (heap_given - slack) & ~0x1FFFFFull : 0;
+            nx2_heap_live(heap_at, heap_host, most);
+            nx2_log("[nx2] the game is told of %u MB: its heap, when it asks for one, is the kernel's own, after the host's part\n", most >> 20);
+            live = 1;
+        }
+#endif
+    }
+    if (early_block) block = early_block, heap = early_size;
+    for (; !live && !block && heap >= (64u << 20); heap = heap > (1ull << 30) ? heap - (256u << 20) : heap >> 1) {
+        nx2_log("[nx2] asking for %u MB for the game's heap\n", heap >> 20);
+        nx2_log_flush();
+        u8 *raw = malloc(heap + 0x200000);
+        if (raw) {
+            block = (u8 *)(((u64)raw + 0x1FFFFF) & ~0x1FFFFFull);
+            break;
+        }
+    }
+    if (!block) heap = 0;
+    if (!live) {
+        nx2_log("[nx2] %u MB at %p; clearing it\n", heap >> 20, (u64)block);
+        nx2_log_flush();
+        for (u64 at = 0; at < heap; at += 64u << 20) memset(block + at, 0, heap - at < (64u << 20) ? heap - at : 64u << 20);
+        nx2_heap_set(block, heap);
+    }
+    nx2_log("[nx2] the game's heap is ready\n");
+    nx2_log_flush();
+
+    {
+        FILE *f = fopen(NX2_DIR "debug", "rb");
+        if (f) fclose(f), nx2_debug = 1;
+        nx2_log("[nx2] the long log is %s (<folder>/debug %s)\n", nx2_debug ? "on" : "off", nx2_debug ? "is there" : "isn't there");
+        {  // (<folder>/onecore: the game's threads are left on the core the system gives them, not spread over three; svc.c)
+            FILE *one = fopen(NX2_DIR "onecore", "rb");
+            nx2_onecore = one != NULL;
+            if (one) fclose(one);
+            FILE *ipc = fopen(NX2_DIR "ipclog", "rb");
+            nx2_ipclog = ipc != NULL;
+            if (ipc) fclose(ipc);
+            FILE *pin = fopen(NX2_DIR "pin", "rb");
+            nx2_pin = pin != NULL;
+            if (pin) fclose(pin);
+            FILE *nl = fopen(NX2_DIR "nvnlock", "rb");
+            nx2_nvnlock = nl != NULL;
+            if (nl) fclose(nl);
+            FILE *bo = fopen(NX2_DIR "bounce", "rb");
+            nx2_bounce = bo != NULL;
+            if (bo) fclose(bo);
+            FILE *sw = fopen(NX2_DIR "stackwatch", "rb");
+            nx2_stackwatch = sw != NULL;
+            if (sw) fclose(sw);
+            FILE *noplt = fopen(NX2_DIR "noplt", "rb");
+            nx2_noplt = noplt != NULL;
+            if (noplt) fclose(noplt);
+            FILE *own = fopen(NX2_DIR "ownapplet", "rb");
+            nx2_ownapplet = own != NULL;
+            if (own) fclose(own);
+            // (<folder>/erpt: the console's error reports are looked at and copied to <folder>/reports/, and that is all this run
+            // does; erpt.c)
+            // (<folder>/control: the game's name, version and icon are asked of the console and written to the card, and that is
+            // all this run does; control.c, tools/control.py)
+            FILE *co = fopen(NX2_DIR "control", "rb");
+            if (co) {
+                void nx2_control_look(void);
+                fclose(co);
+                nx2_control_look();
+                nx2_log_end();
+                heap_back();
+                return 0;
+            }
+            FILE *er = fopen(NX2_DIR "erpt", "rb");
+            if (er) {
+                void nx2_erpt_look(void);
+                fclose(er);
+                nx2_erpt_look();
+                nx2_log_flush();
+                nx2_log_end();
+                heap_back();
+                return 0;
+            }
+        }
+        // <folder>/trace: every call between modules is logged (not just each one's first), from the first call of a function
+        // whose name has the file's text in it (an empty file: from the start). For finding where a game ends without a word.
+        extern char nx2_trace[96];
+        extern int nx2_trace_on;
+        {
+            extern char nx2_slow[64];
+            FILE *slow = fopen(NX2_DIR "slow", "rb");
+            if (slow) {
+                size_t n = fread(nx2_slow, 1, sizeof nx2_slow - 1, slow);
+                while (n && (nx2_slow[n - 1] == 10 || nx2_slow[n - 1] == 13 || nx2_slow[n - 1] == ' ')) n--;
+                nx2_slow[n] = 0;
+                fclose(slow);
+            }
+        }
+        f = fopen(NX2_DIR "trace", "rb");
+        if (f) {
+            size_t n = fread(nx2_trace, 1, sizeof nx2_trace - 1, f);
+            while (n && (nx2_trace[n - 1] == '\n' || nx2_trace[n - 1] == '\r' || nx2_trace[n - 1] == ' ')) n--;
+            nx2_trace[n] = 0;
+            fclose(f);
+            nx2_trace_on = n ? 1 : 2;
+            nx2_log("[nx2] every call between modules is logged, from %s%s\n", n ? "the first call of a function named like " : "the start", nx2_trace);
+        }
+    }
+    nx2_rom_open();
+    nx2_save_open();
+#ifdef __SWITCH2__
+    {  // the game's sound (audio2.c), and the picture's size (gl2.c): both decided before the game's imports are bound
+#ifndef NX2_GAME_MB  // (a Switch 2 game's SDK opens aud:u itself: the port takes no session of it)
+        static Service audio;
+        const Result rc = auduOpenAudioOutManager(&audio);
+        if (R_SUCCEEDED(rc) && !audio.object_id) nx2_audio_master = audio.session;
+        nx2_log("[audio] the Switch 2's audio output manager (aud:u): %x, session %x%s\n", (u64)rc, (u64)audio.session,
+                nx2_audio_master ? ": the game's sound goes to it" : ": not usable, the game's sound will be silent");
+        static Service renderer;
+        const Result rc2 = auduOpenAudioRendererManager(&renderer);
+        if (R_SUCCEEDED(rc2) && !renderer.object_id) nx2_audren_master = renderer.session;
+        nx2_log("[audio] the Switch 2's audio renderer manager (aud:u): %x, session %x%s\n", (u64)rc2, (u64)renderer.session,
+                nx2_audren_master ? ": a game's audio renderer goes to it" : ": not usable");
+#endif
+        nx2_gl_config();
+    }
+#endif
+    if (nx2_load()) {  // (the modules couldn't be put in memory: said in the log, and back to where this was started from)
+        nx2_log_flush();
+        nx2_crash("the game's modules could not be put in memory (the log's lines that begin \"[load]\" say which and why)");
+        nx2_log_end();
+        heap_back();
+        return 1;
+    }
+    // The system gives a program one applet session (appletOE), and the host library opened it at start; the SDK asks for its own
+    // (nn::oe::Initialize) and was refused: result 3e880, then Break (log, 2026-11-22). So the host's is closed first, as one
+    // homebrew program does before the next is loaded into the same process.
+    // Not on a Switch 2: there the SDK's request after this close ended in a fatal error of the system's applet manager (2128-0007,
+    // the console had to be forced off; log, 2026-11-22). Left open there, the request is refused and the game stops cleanly.
+#ifdef __SWITCH2__
+    // (<folder>/ownapplet: a try of the Switch's way for a Switch 2 game's own SDK, which registers by a command of its own kind.)
+    if (nx2_ownapplet) {
+        nx2_log("[nx2] the host library's applet session is closed (<folder>/ownapplet): the SDK opens and registers its own\n");
+        nx2_log_flush();
+        appletExit();
+        nx2_log("[nx2] closed\n");
+        nx2_log_flush();
+    }
+#endif
+#ifndef __SWITCH2__
+    appletExit();
+    nx2_log("[nx2] the host library's applet session is closed: the SDK opens its own\n");
+#endif
+    nx2_log_flush();
+#ifdef __SWITCH2__
+    // The controllers: the host library has its own use of the hid service from its start, and the SDK's was then refused
+    // (CreateAppletResource: 82cca; log, 2026-11-22). The host has no use for its own, so it is given up before the game asks.
+    nx2_log("[nx2] the host library's hid session: %s\n", serviceIsActive(hidGetServiceSession()) ? "open; closed now" : "not open");
+    if (serviceIsActive(hidGetServiceSession())) hidExit();
+    nx2_log_flush();
+    {
+        // A Switch 2 game that draws through its own SDK (<folder>/native): the host library made a window of its own at
+        // its start, on the layer the system gives the program, and the SDK then opens that layer too. On a Switch the host's
+        // side of all this is closed before the game starts (appletExit, above); here the window and the host's display session
+        // are, so that the layer is the SDK's alone, as it is the game's on its console.
+        FILE *native = fopen(NX2_DIR "native", "rb");
+        int is_native = native != NULL;
+        if (native) fclose(native);
+#ifdef NX2_GAME_MB
+        is_native = 1;  // (built as a Switch 2 game, tools/build.py: the file is for a try with any other)
+#endif
+        if (is_native) {
+            extern void __nx_win_exit(void);
+            __nx_win_exit();
+            nx2_log("[nx2] the host library's window and display session are closed: the game's SDK opens its own\n");
+            nx2_log_flush();
+        }
+    }
+    nx2_host_capture();
+#endif
+    nx2_start(envGetMainThreadHandle());
+    nx2_log_end();
+    heap_back();
+    return 0;
+}
