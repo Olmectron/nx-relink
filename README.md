@@ -26,6 +26,8 @@ relinked, not emulated.
 > the game's name and version: that is everything needed to look into it.
 > It is plain text you can read before sending, and has no keys, account or serial number in it.
 
+<p align="center"><img src="docs/window.png" alt="The nx-relink window: choose the game, the card, and press Build and install" width="760"></p>
+
 ## What it does
 
 A Switch game is already code for the Switch's processor. Nothing is translated: the game's modules go into the `.nro` as they are,
